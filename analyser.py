@@ -1,5 +1,5 @@
 from scapy.all import rdpcap, IP, TCP, ARP
-from collections import Counter
+from collections import Counter, defaultdict
 import sys
 
 SYN_THRESHOLD = 100
@@ -17,15 +17,15 @@ def load_packets(path):
 
 def traffic(packets):
     sources = Counter()
-    syn_counter = Counter()
+    #syn_counter = Counter()
 
     for packet in packets:
         if packet.haslayer(IP):
             sources[packet[IP].src] += 1
-            if packet.haslayer(TCP) and packet[TCP].flags == "S":
-                syn_counter[packet[IP].src] += 1
+            #if packet.haslayer(TCP) and packet[TCP].flags == "S":
+            #    syn_counter[packet[IP].src] += 1
 
-    return sources, syn_counter
+    return sources#, syn_counter
 
 
 def check_arp_spoofing(packets):
@@ -43,10 +43,23 @@ def check_arp_spoofing(packets):
                 seen[psrc] = hwsrc
 
         
-def check_syn_flood(syn_counter, threshold=SYN_THRESHOLD):
-    for ip, count in syn_counter.items():
-        if count > threshold:
-            print(f"ALERT: {ip} sent {count} packets (SYN threshold {threshold})\n")
+def check_syn_flood(packets, my_ip, window = 5, threshold=SYN_THRESHOLD):
+    times = defaultdict(list)
+
+    for packet in packets:
+        if packet.haslayer(IP) and packet.haslayer(TCP) and packet[TCP].flags == "S": #only capture SYN and not SYN-ACK
+            if packet[IP].dst == my_ip: #filter to only incoming traffic
+                times[packet[IP].src].append(float(packet.time)) #add capture time to list for its source IP
+
+    for ip, ts in times.items():
+        ts.sort() #order incase capture wasnt ordered
+        for i in range(threshold, len(ts)):
+            if ts[i] - ts[i - threshold] <= window: #if threshhold + 1 SYN arrived within windown, flood
+                print(f"ALERT: {ip} sent {len(ts)} SYNs within {window}s (at t={ts[i]})")
+                break #terminal gets flooded if no break
+
+
+
 
 # do we want a summary?
 #print(f"Busiest IP sources: {sources.most_common(5)}\n")
@@ -54,15 +67,15 @@ def check_syn_flood(syn_counter, threshold=SYN_THRESHOLD):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <file.pcap>")
+    if len(sys.argv) != 3:
+        print(f"Usage: {sys.argv[0]} <file.pcap> <your_ip>")
         sys.exit(1)
 
     packets = load_packets(sys.argv[1])
-    sources, syn_counter = traffic(packets)
+    sources = traffic(packets) #syn_counter removed for now
 
     check_arp_spoofing(packets)
-    check_syn_flood(syn_counter)
+    check_syn_flood(packets, my_ip=sys.argv[2]) #fake_synflood.pcap uses 10.0.0.5
 
 if __name__ == "__main__":
     main()
