@@ -17,15 +17,20 @@ def load_packets(path):
 
 def traffic(packets):
     sources = Counter()
-    #syn_counter = Counter()
+    syn_counter = Counter()
+    synack_counter = Counter()
 
     for packet in packets:
         if packet.haslayer(IP):
             sources[packet[IP].src] += 1
-            #if packet.haslayer(TCP) and packet[TCP].flags == "S":
-            #    syn_counter[packet[IP].src] += 1
+            if packet.haslayer(TCP):
+                flag = packet[TCP].flags
+                if flag == "S":
+                    syn_counter[packet[IP].src] += 1
+                elif flag == "SA":
+                    synack_counter[packet[IP].dst] += 1
 
-    return sources#, syn_counter
+    return sources, syn_counter, synack_counter
 
 
 def check_arp_spoofing(packets):
@@ -58,7 +63,15 @@ def check_syn_flood(packets, my_ip, window = 5, threshold=SYN_THRESHOLD):
                 print(f"ALERT: {ip} sent {len(ts)} SYNs within {window}s (at t={ts[i]})")
                 break #terminal gets flooded if no break
 
+def syn_ratio(syn_counter, synack_counter):
+    total_syn = sum(syn_counter.values())
+    total_synack = sum(synack_counter.values())
 
+    print(f"Total SYN: {total_syn}, Total SYN-ACK: {total_synack}")
+    if total_synack:
+        print(f"Overall SYN:SYN-ACK ratio: {total_syn / total_synack:.2f}")
+    else:
+        print(f"No SYN-ACK's seen.")
 
 
 # do we want a summary?
@@ -72,10 +85,11 @@ def main():
         sys.exit(1)
 
     packets = load_packets(sys.argv[1])
-    sources = traffic(packets) #syn_counter removed for now
+    sources, syn_counter, synack_counter = traffic(packets)
 
     check_arp_spoofing(packets)
     check_syn_flood(packets, my_ip=sys.argv[2]) #fake_synflood.pcap uses 10.0.0.5
+    syn_ratio(syn_counter, synack_counter)
 
 if __name__ == "__main__":
     main()
