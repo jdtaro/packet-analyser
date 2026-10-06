@@ -3,6 +3,7 @@ from collections import Counter, defaultdict
 import sys
 
 SYN_THRESHOLD = 100
+PORT_SCAN_THRESHOLD = 20
 
 #file = "fake_synflood.pcap"
 #file = "testCapture.pcap"
@@ -23,6 +24,7 @@ def traffic(packets):
     for packet in packets:
         if packet.haslayer(IP):
             sources[packet[IP].src] += 1
+            #print(packet[IP].dst)
             if packet.haslayer(TCP):
                 flag = packet[TCP].flags
                 if flag == "S":
@@ -74,6 +76,23 @@ def syn_ratio(syn_counter, synack_counter):
         print(f"No SYN-ACK's seen.")
 
 
+def check_port_scan(packets, my_ip, threshold=PORT_SCAN_THRESHOLD):
+    hit_ports = defaultdict(set)
+
+    for packet in packets:
+        if packet.haslayer(IP) and packet.haslayer(TCP) and packet[TCP].flags == "S":
+            src = packet[IP].src
+            if src == my_ip:
+                continue
+            hit_ports[src].add((packet[IP].dst, packet[TCP].dport))
+
+    for ip, targets in hit_ports.items():
+        ports = {port for _, port in targets} #vertical, many ports 1 host
+        hosts = {host for host, _ in targets} #horizontal, many hosts, 1 port, should always be 1 as not network wide tests?
+        if len(ports) > threshold:
+            print(f"ALERT: possible port scan from {ip}: "
+                  f"{len(ports)} distinct ports scross {len(hosts)} host(s)")
+
 # do we want a summary?
 #print(f"Busiest IP sources: {sources.most_common(5)}\n")
 #print(f"Busiest SYN sources: {syn_counter.most_common(5)}\n")
@@ -86,10 +105,12 @@ def main():
 
     packets = load_packets(sys.argv[1])
     sources, syn_counter, synack_counter = traffic(packets)
+    my_ip=sys.argv[2]
 
     check_arp_spoofing(packets)
-    check_syn_flood(packets, my_ip=sys.argv[2]) #fake_synflood.pcap uses 10.0.0.5
+    check_syn_flood(packets, my_ip) #fake_synflood.pcap uses 10.0.0.5
     syn_ratio(syn_counter, synack_counter)
+    check_port_scan(packets, my_ip)
 
 if __name__ == "__main__":
     main()
