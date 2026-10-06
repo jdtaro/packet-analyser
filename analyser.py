@@ -62,7 +62,7 @@ def check_syn_flood(packets, my_ip, window = 5, threshold=SYN_THRESHOLD):
         ts.sort() #order incase capture wasnt ordered
         for i in range(threshold, len(ts)):
             if ts[i] - ts[i - threshold] <= window: #if threshhold + 1 SYN arrived within windown, flood
-                print(f"ALERT: {ip} sent {len(ts)} SYNs within {window}s (at t={ts[i]})")
+                print(f"ALERT: {ip} sent {len(ts)} SYNs within {window}s (at t={ts[i]:.2f})")
                 break #terminal gets flooded if no break
 
 def syn_ratio(syn_counter, synack_counter):
