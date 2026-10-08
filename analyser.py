@@ -1,9 +1,33 @@
 from scapy.all import rdpcap, IP, TCP, ARP
 from collections import Counter, defaultdict
+from dataclasses import dataclass
+from typing import Optional
 import sys
 
+@dataclass
+class Finding:
+    kind: str
+    attacker: str
+    victim: str
+    evidence: str
+    time: Optional[float] = None
+
 SYN_THRESHOLD = 100
+SYN_WINDOW = 5
+
 PORT_SCAN_THRESHOLD = 20
+HOST_SCAN_THRESHOLD = 20 #testCapture.pcap triggers at 15
+
+SYN = 0x02
+ACK = 0x10
+
+def is_syn(tcp) -> bool:
+    flags = int(tcp.flags)
+    return (flags & (SYN|ACK)) == SYN #mask, SYN is set and ACK isnt
+
+def is_synack(tcp) -> bool:
+    flags = int(tcp.flags)
+    return (flags & (SYN|ACK)) == (SYN|ACK)
 
 #file = "fake_synflood.pcap"
 #file = "testCapture.pcap"
@@ -50,20 +74,40 @@ def check_arp_spoofing(packets):
                 seen[psrc] = hwsrc
 
         
-def check_syn_flood(packets, my_ip, window = 5, threshold=SYN_THRESHOLD):
-    times = defaultdict(list)
+def check_syn_flood(packets, window = SYN_WINDOW, threshold=SYN_THRESHOLD):
+    """
+    Detects bursts of SYNs aimed at a single host.
+
+    For each SYN, counts how many go to the same host within 'window'seconds.
+    Flagged if that count passes 'threshold', from any number of sources.
+
+    Returns a list of Finding objects.
+    """
+    incomming = defaultdict(list)
 
     for packet in packets:
-        if packet.haslayer(IP) and packet.haslayer(TCP) and packet[TCP].flags == "S": #only capture SYN and not SYN-ACK
-            if packet[IP].dst == my_ip: #filter to only incoming traffic
-                times[packet[IP].src].append(float(packet.time)) #add capture time to list for its source IP
+        if packet.haslayer(IP) and packet.haslayer(TCP) and is_syn(packet[TCP]):
+            incomming[packet[IP].dst].append((float(packet.time), packet[IP].src))
 
-    for ip, ts in times.items():
-        ts.sort() #order incase capture wasnt ordered
-        for i in range(threshold, len(ts)):
-            if ts[i] - ts[i - threshold] <= window: #if threshhold + 1 SYN arrived within windown, flood
-                print(f"ALERT: {ip} sent {len(ts)} SYNs within {window}s (at t={ts[i]:.2f})")
-                break #terminal gets flooded if no break
+    findings = []
+    for ip, ts in incomming.items():
+        for start_time, _ in ts:
+            in_window = [(time, src) for time, src in ts
+                         if start_time <= time <= start_time + window]
+
+            if len(in_window) > threshold:
+                sources = {src for _, src in in_window}
+                findings.append(Finding(
+                    kind= "SYN Flood",
+                    attacker= f"{len(sources)} source(s)",
+                    victim= ip,
+                    evidence= f"{len(in_window)} SYNs within {window}s from {len(sources)}",
+                    time=start_time
+                ))
+                break
+    return findings
+
+
 
 def syn_ratio(syn_counter, synack_counter):
     total_syn = sum(syn_counter.values())
@@ -76,26 +120,56 @@ def syn_ratio(syn_counter, synack_counter):
         print(f"No SYN-ACK's seen.")
 
 
-def check_port_scan(packets, my_ip, threshold=PORT_SCAN_THRESHOLD):
-    hit_ports = defaultdict(set)
+
+
+def check_port_scan(packets, port_threshold=PORT_SCAN_THRESHOLD, host_threshold=HOST_SCAN_THRESHOLD):
+    """
+    Detects vertical and horizontal TCP SYN scans.
+
+    Groups the SYN packets by source IP, then flags a source if it has probed either:
+    - more than 'port_threshold' distinct ports on a single host (vertical scan)
+    - the same port on more than 'host_threshold' distinct hosts (horizontal scan)
+
+    Returns a list of Finding objects.
+    """
+    targets = defaultdict(set)
 
     for packet in packets:
-        if packet.haslayer(IP) and packet.haslayer(TCP) and packet[TCP].flags == "S":
-            src = packet[IP].src
-            if src == my_ip:
-                continue
-            hit_ports[src].add((packet[IP].dst, packet[TCP].dport))
+        if packet.haslayer(IP) and packet.haslayer(TCP) and is_syn(packet[TCP]):
+            targets[packet[IP].src].add((packet[IP].dst, packet[TCP].dport))
 
-    for ip, targets in hit_ports.items():
-        ports = {port for _, port in targets} #vertical, many ports 1 host
-        hosts = {host for host, _ in targets} #horizontal, many hosts, 1 port, should always be 1 as not network wide tests?
-        if len(ports) > threshold:
-            print(f"ALERT: possible port scan from {ip}: "
-                  f"{len(ports)} distinct ports scross {len(hosts)} host(s)")
+    findings = []
+    for src, pairs in targets.items():
+        ports_per_host = defaultdict(set)
+        hosts_per_port = defaultdict(set)
 
-# do we want a summary?
-#print(f"Busiest IP sources: {sources.most_common(5)}\n")
-#print(f"Busiest SYN sources: {syn_counter.most_common(5)}\n")
+        for host, port in pairs:
+            ports_per_host[host].add(port)
+            hosts_per_port[port].add(host)
+
+        # vertical scan
+        for host, ports in ports_per_host.items():
+            if len(ports) > port_threshold:
+                findings.append(Finding(
+                    kind= "Vertical port scan",
+                    attacker= src,
+                    victim= host,
+                    evidence= f"{len(ports)} distinct ports probed."
+                ))
+
+        # horizontal scan
+        for port, hosts in hosts_per_port.items():
+            #print(f"DEBUG {src} port {port}: {len(hosts)} hosts")
+            if len(hosts) > host_threshold:
+                findings.append(Finding(
+                    kind= "Horizontal port scan",
+                    attacker= src,
+                    victim= f"{len(hosts)} hosts",
+                    evidence= f"port {port} probed by {len(hosts)} hosts."
+                ))
+    return findings
+
+    
 
 
 def main():
@@ -108,9 +182,24 @@ def main():
     my_ip=sys.argv[2]
 
     check_arp_spoofing(packets)
-    check_syn_flood(packets, my_ip) #fake_synflood.pcap uses 10.0.0.5
+    check_syn_flood(packets) #fake_synflood.pcap uses 10.0.0.5
     syn_ratio(syn_counter, synack_counter)
-    check_port_scan(packets, my_ip)
+    check_port_scan(packets)
+
+
+    #FOR DEBUGGING
+    targets1 = defaultdict(set)
+    for p in packets:
+        if p.haslayer(IP) and p.haslayer(TCP) and is_syn(p[TCP]):
+            targets1[p[IP].src].add((p[IP].dst, p[TCP].dport))
+    for src, pairs in targets1.items():
+        print(src, "hosts:", len({h for h, _ in pairs}), "ports:", len({i for _, i in pairs}))
+
+    for f in check_syn_flood(packets):
+        print(f"ALERT [{f.kind}] {f.attacker} -> {f.victim}: {f.evidence} {f.time}")
+
+    for f in check_port_scan(packets):
+            print(f"ALERT [{f.kind}] {f.attacker} -> {f.victim}: {f.evidence}")    
 
 if __name__ == "__main__":
     main()
