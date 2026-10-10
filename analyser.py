@@ -74,7 +74,7 @@ def check_arp_spoofing(packets):
                 seen[psrc] = hwsrc
 
         
-def check_syn_flood(packets, window = SYN_WINDOW, threshold=SYN_THRESHOLD):
+def check_syn_flood_simple(packets, window = SYN_WINDOW, threshold=SYN_THRESHOLD):
     """
     Detects bursts of SYNs aimed at a single host.
 
@@ -105,6 +105,65 @@ def check_syn_flood(packets, window = SYN_WINDOW, threshold=SYN_THRESHOLD):
                     time=start_time
                 ))
                 break
+    return findings
+
+
+def check_syn_flood(packets, window = SYN_WINDOW, threshold=SYN_THRESHOLD):
+    """
+    Detects bursts of SYNs aimed at a single host. Refactored improved version.
+
+    For each SYN, counts how many go to the same host within 'window'seconds.
+    Flagged if that count passes 'threshold', from any number of sources.
+
+    Returns a list of Finding objects.
+    """
+    incomming = defaultdict(list)
+
+    # collect every SYN grouped by destination
+    for packet in packets:
+        if packet.haslayer(IP) and packet.haslayer(TCP) and is_syn(packet[TCP]):
+            dest = packet[IP].dst
+            source = packet[IP].src
+            time = float(packet.time)
+            incomming[dest].append((time, source))
+
+    # for each destination, slide a window along its SYNs
+    findings = []
+    for dest in incomming:
+        events = incomming[dest]
+        events.sort()
+
+        # split into two lists that line up
+        times = []
+        sources = []
+        for event in events:
+            times.append(event[0])
+            sources.append(event[1])
+
+        start = 0
+        for end in range(len(times)): #right edge that moves along one SYN at a time
+            while times[end] - times[start] > window: #if too wide, move left forwrds
+                start += 1
+            count = end - start + 1 #everything from start to end is in the window
+            if count > threshold:
+                unique_srcs = set() #find who sent the SYNs
+                for i in range(start, end + 1):
+                    unique_srcs.add(sources[i])
+
+                if len(unique_srcs) == 1:
+                    for src_ip in unique_srcs:
+                        attacker = src_ip #might be better way to get this
+                else:
+                    attacker = f"{len(unique_srcs)} sources"
+
+                findings.append(Finding(
+                    kind= "SYN Flood",
+                    attacker= attacker,
+                    victim = dest,
+                    evidence= f"{count} SYNs in {window}s from {len(unique_srcs)} source(s)",
+                    time= times[end]
+                ))
+                break #will stop after the threshold has been hit
     return findings
 
 
@@ -182,7 +241,7 @@ def main():
     my_ip=sys.argv[2]
 
     check_arp_spoofing(packets)
-    check_syn_flood(packets) #fake_synflood.pcap uses 10.0.0.5
+    check_syn_flood_simple(packets) #fake_synflood.pcap uses 10.0.0.5
     syn_ratio(syn_counter, synack_counter)
     check_port_scan(packets)
 
@@ -195,8 +254,11 @@ def main():
     for src, pairs in targets1.items():
         print(src, "hosts:", len({h for h, _ in pairs}), "ports:", len({i for _, i in pairs}))
 
+    for f in check_syn_flood_simple(packets):
+        print(f"ALERT SIMPLE [{f.kind}] {f.attacker} -> {f.victim}: {f.evidence} {f.time}")
+
     for f in check_syn_flood(packets):
-        print(f"ALERT [{f.kind}] {f.attacker} -> {f.victim}: {f.evidence} {f.time}")
+            print(f"ALERT [{f.kind}] {f.attacker} -> {f.victim}: {f.evidence} {f.time}")
 
     for f in check_port_scan(packets):
             print(f"ALERT [{f.kind}] {f.attacker} -> {f.victim}: {f.evidence}")    
