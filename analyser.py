@@ -15,8 +15,9 @@ class Finding:
 SYN_THRESHOLD = 100
 SYN_WINDOW = 5
 
-PORT_SCAN_THRESHOLD = 20
+PORT_SCAN_THRESHOLD = 20 #testCapture.pcap triggers at 0
 HOST_SCAN_THRESHOLD = 20 #testCapture.pcap triggers at 15
+HOST_SCAN_WINDOW = 5
 
 SYN = 0x02
 ACK = 0x10
@@ -29,6 +30,19 @@ def is_synack(tcp) -> bool:
     flags = int(tcp.flags)
     return (flags & (SYN|ACK)) == (SYN|ACK)
 
+def max_distinct_in_window(events, window):
+    '''events: sorted list of (time, value)
+    Returns the most distinct values in any window of 'window' seconds.
+    '''
+    best = 0
+    start = 0
+    for end in range(len(events)):
+        while events[end][0] - events[start][0] > window:
+            start += 1
+        distinct = {value for _, value in events[start:end + 1]}
+        best = max(best, len(distinct))
+    return best
+
 #file = "fake_synflood.pcap"
 #file = "testCapture.pcap"
 #file = "arp_spoof.pcap"
@@ -38,25 +52,6 @@ def load_packets(path):
     packets = rdpcap(path)
     print(f"Loaded {path}, reading {len(packets)}\n")
     return packets
-
-
-def traffic(packets):
-    sources = Counter()
-    syn_counter = Counter()
-    synack_counter = Counter()
-
-    for packet in packets:
-        if packet.haslayer(IP):
-            sources[packet[IP].src] += 1
-            #print(packet[IP].dst)
-            if packet.haslayer(TCP):
-                flag = packet[TCP].flags
-                if flag == "S":
-                    syn_counter[packet[IP].src] += 1
-                elif flag == "SA":
-                    synack_counter[packet[IP].dst] += 1
-
-    return sources, syn_counter, synack_counter
 
 
 def check_arp_spoofing(packets):
@@ -181,9 +176,9 @@ def syn_ratio(syn_counter, synack_counter):
 
 
 
-def check_port_scan(packets, port_threshold=PORT_SCAN_THRESHOLD, host_threshold=HOST_SCAN_THRESHOLD):
+def check_port_scan(packets, port_threshold=PORT_SCAN_THRESHOLD, host_threshold=HOST_SCAN_THRESHOLD, window=HOST_SCAN_WINDOW):
     """
-    Detects vertical and horizontal TCP SYN scans.
+    Detects vertical and horizontal TCP SYN scans within a "window" timeframe.
 
     Groups the SYN packets by source IP, then flags a source if it has probed either:
     - more than 'port_threshold' distinct ports on a single host (vertical scan)
@@ -192,40 +187,44 @@ def check_port_scan(packets, port_threshold=PORT_SCAN_THRESHOLD, host_threshold=
     Returns a list of Finding objects.
     """
     targets = defaultdict(set)
+    horizontal_piles = defaultdict(list)
+    vertical_piles = defaultdict(list)
 
     for packet in packets:
         if packet.haslayer(IP) and packet.haslayer(TCP) and is_syn(packet[TCP]):
-            targets[packet[IP].src].add((packet[IP].dst, packet[TCP].dport))
+            src = packet[IP].src
+            dst = packet[IP].dst
+            dport = packet[TCP].dport
+            targets[src].add((dst, dport))
+            horizontal_piles[(src, dport)].append((float(packet.time), dst))
+            vertical_piles[(src, dst)].append((float(packet.time),dport))
 
     findings = []
-    for src, pairs in targets.items():
-        ports_per_host = defaultdict(set)
-        hosts_per_port = defaultdict(set)
+    #horizontal scan (now windowed)
+    for (src, dport), events in horizontal_piles.items():
+        events.sort()
+        distinct = max_distinct_in_window(events,window)
+        #print(src, dport, "distinct in window:", distinct, "total events: ", len(events))
+        if distinct > host_threshold:
+            findings.append(Finding(
+                kind="Horizontal port scan",
+                attacker=src,
+                victim= f"{distinct} hosts",
+                evidence= f"port {dport} probed on {distinct} hosts within {window}s"
+            ))
 
-        for host, port in pairs:
-            ports_per_host[host].add(port)
-            hosts_per_port[port].add(host)
-
-        # vertical scan
-        for host, ports in ports_per_host.items():
-            if len(ports) > port_threshold:
-                findings.append(Finding(
-                    kind= "Vertical port scan",
-                    attacker= src,
-                    victim= host,
-                    evidence= f"{len(ports)} distinct ports probed."
-                ))
-
-        # horizontal scan
-        for port, hosts in hosts_per_port.items():
-            #print(f"DEBUG {src} port {port}: {len(hosts)} hosts")
-            if len(hosts) > host_threshold:
-                findings.append(Finding(
-                    kind= "Horizontal port scan",
-                    attacker= src,
-                    victim= f"{len(hosts)} hosts",
-                    evidence= f"port {port} probed by {len(hosts)} hosts."
-                ))
+    #vertical scan (now windowed)
+    for (src, dst), events in vertical_piles.items():
+        events.sort()
+        distinct = max_distinct_in_window(events, window)
+        #print(src, dst, "distinct in window:", distinct, "total events: ", len(events))
+        if distinct > port_threshold:
+            findings.append(Finding(
+                kind= "Vertical port scan",
+                attacker= src,
+                victim= dst,
+                evidence= f"{distinct} distinct ports probed within {window}s."
+            ))
     return findings
 
     
@@ -237,12 +236,9 @@ def main():
         sys.exit(1)
 
     packets = load_packets(sys.argv[1])
-    sources, syn_counter, synack_counter = traffic(packets)
-    my_ip=sys.argv[2]
 
     check_arp_spoofing(packets)
     check_syn_flood_simple(packets) #fake_synflood.pcap uses 10.0.0.5
-    syn_ratio(syn_counter, synack_counter)
     check_port_scan(packets)
 
 
